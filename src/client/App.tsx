@@ -13,7 +13,7 @@ import {
   ShieldQuestion,
   X
 } from "lucide-react";
-import maplibregl, { Map as MapLibreMap, Marker } from "maplibre-gl";
+import maplibregl, { GeoJSONSource, Map as MapLibreMap, Marker, MapLayerMouseEvent } from "maplibre-gl";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { accessLabel, wheelchairLabel } from "../shared/access";
 import { DEFAULT_CENTER, PLACE_PRESETS, formatDistance, haversineMeters } from "../shared/geo";
@@ -26,6 +26,14 @@ type TrackingState = "idle" | "requesting" | "active" | "denied" | "unavailable"
 
 const defaultRadiusMeters = 35_000;
 const trackingRadiusMeters = 12_000;
+const restroomSourceId = "restroom-points-source";
+const restroomLayerId = "restroom-points";
+
+declare global {
+  interface Window {
+    __restroomMap?: MapLibreMap;
+  }
+}
 
 export function App() {
   const [searchOrigin, setSearchOrigin] = useState({ lat: DEFAULT_CENTER.lat, lng: DEFAULT_CENTER.lng });
@@ -43,12 +51,13 @@ export function App() {
   const [userLocation, setUserLocation] = useState<{ lat: number; lng: number; accuracy: number | null } | null>(null);
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
-  const markersRef = useRef<Marker[]>([]);
   const userMarkerRef = useRef<Marker | null>(null);
+  const restroomsByIdRef = useRef<Map<string, RestroomWithStatus>>(new Map());
   const watchIdRef = useRef<number | null>(null);
   const hasCenteredOnUserRef = useRef(false);
   const lastTrackedSearchRef = useRef<{ lat: number; lng: number } | null>(null);
   const suppressNextMoveEndRef = useRef(false);
+  const moveSettledTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     void fetchStats()
@@ -106,37 +115,66 @@ export function App() {
       zoom: 10
     });
     map.addControl(new maplibregl.NavigationControl({ visualizePitch: false }), "bottom-right");
+    map.scrollZoom.enable();
+    map.dragPan.enable();
+    map.touchZoomRotate.enable({ around: "center" });
     map.on("moveend", () => {
       if (suppressNextMoveEndRef.current) {
         suppressNextMoveEndRef.current = false;
         return;
       }
-      setHasMovedMap(true);
+      if (moveSettledTimerRef.current !== null) {
+        window.clearTimeout(moveSettledTimerRef.current);
+      }
+      moveSettledTimerRef.current = window.setTimeout(() => {
+        setHasMovedMap(true);
+        moveSettledTimerRef.current = null;
+      }, 300);
+    });
+    map.on("load", () => {
+      ensureRestroomLayer(map);
+      updateRestroomLayer(map, restroomsByIdRef.current);
+      map.on("click", restroomLayerId, (event: MapLayerMouseEvent) => {
+        const id = event.features?.[0]?.properties?.id;
+        if (!id) return;
+        const restroom = restroomsByIdRef.current.get(String(id));
+        if (!restroom) return;
+        setSelected(restroom);
+        suppressNextMoveEndRef.current = true;
+        map.flyTo({
+          center: [restroom.longitude, restroom.latitude],
+          zoom: Math.max(map.getZoom(), 14),
+          duration: 500
+        });
+      });
+      map.on("mouseenter", restroomLayerId, () => {
+        map.getCanvas().style.cursor = "pointer";
+      });
+      map.on("mouseleave", restroomLayerId, () => {
+        map.getCanvas().style.cursor = "";
+      });
     });
     mapRef.current = map;
+    if (import.meta.env.DEV) {
+      window.__restroomMap = map;
+    }
     return () => {
+      if (moveSettledTimerRef.current !== null) {
+        window.clearTimeout(moveSettledTimerRef.current);
+      }
       map.remove();
       mapRef.current = null;
+      if (import.meta.env.DEV && window.__restroomMap === map) {
+        window.__restroomMap = undefined;
+      }
     };
   }, []);
 
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-    markersRef.current.forEach((marker) => marker.remove());
-    markersRef.current = restrooms.map((restroom) => {
-      const element = document.createElement("button");
-      element.className = `map-pin map-pin-${restroom.openStatus}`;
-      element.type = "button";
-      element.setAttribute("aria-label", restroom.name);
-      element.addEventListener("click", () => {
-        setSelected(restroom);
-        map.flyTo({ center: [restroom.longitude, restroom.latitude], zoom: Math.max(map.getZoom(), 14), duration: 500 });
-      });
-      return new maplibregl.Marker({ element })
-        .setLngLat([restroom.longitude, restroom.latitude])
-        .addTo(map);
-    });
+    restroomsByIdRef.current = new Map(restrooms.map((restroom) => [restroom.id, restroom]));
+    updateRestroomLayer(map, restroomsByIdRef.current);
   }, [restrooms]);
 
   useEffect(() => {
@@ -550,4 +588,68 @@ function locationAccuracyText(accuracy: number | null): string {
 
 function isCandidateHost(record: RestroomWithStatus): boolean {
   return record.sourceRefs.some((source) => source.source === "OpenStreetMap Candidate Host");
+}
+
+function ensureRestroomLayer(map: MapLibreMap) {
+  if (!map.getSource(restroomSourceId)) {
+    map.addSource(restroomSourceId, {
+      type: "geojson",
+      data: emptyRestroomFeatureCollection()
+    });
+  }
+  if (!map.getLayer(restroomLayerId)) {
+    map.addLayer({
+      id: restroomLayerId,
+      type: "circle",
+      source: restroomSourceId,
+      paint: {
+        "circle-radius": [
+          "case",
+          ["==", ["get", "status"], "candidate"],
+          5,
+          6
+        ],
+        "circle-color": [
+          "match",
+          ["get", "status"],
+          "open",
+          "#228b58",
+          "closed",
+          "#b94a3c",
+          "candidate",
+          "#4338ca",
+          "#b97816"
+        ],
+        "circle-stroke-color": "#ffffff",
+        "circle-stroke-width": 2,
+        "circle-opacity": 0.96
+      }
+    });
+  }
+}
+
+function updateRestroomLayer(map: MapLibreMap, restroomsById: Map<string, RestroomWithStatus>) {
+  if (!map.loaded() || !map.getSource(restroomSourceId)) return;
+  const source = map.getSource(restroomSourceId) as GeoJSONSource;
+  source.setData({
+    type: "FeatureCollection",
+    features: [...restroomsById.values()].map((restroom) => ({
+      type: "Feature",
+      geometry: {
+        type: "Point",
+        coordinates: [restroom.longitude, restroom.latitude]
+      },
+      properties: {
+        id: restroom.id,
+        status: isCandidateHost(restroom) ? "candidate" : restroom.openStatus
+      }
+    }))
+  });
+}
+
+function emptyRestroomFeatureCollection() {
+  return {
+    type: "FeatureCollection" as const,
+    features: []
+  };
 }
