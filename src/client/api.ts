@@ -3,6 +3,7 @@ import type { AppStats, RestroomWithStatus } from "../shared/types";
 export interface RestroomApiQuery {
   lat?: number;
   lng?: number;
+  bbox?: [number, number, number, number];
   radiusMeters?: number;
   openNow?: boolean;
   accessible?: boolean;
@@ -13,7 +14,8 @@ export interface RestroomApiQuery {
 export async function fetchRestrooms(query: RestroomApiQuery): Promise<RestroomWithStatus[]> {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) {
-    if (value !== undefined && value !== false) params.set(key, String(value));
+    if (value === undefined || value === false) continue;
+    params.set(key, Array.isArray(value) ? value.join(",") : String(value));
   }
   const response = await fetch(`/api/restrooms?${params.toString()}`);
   if (!response.ok) throw new Error("Unable to load restroom data");

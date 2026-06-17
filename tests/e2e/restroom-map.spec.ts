@@ -24,6 +24,21 @@ test("asks for while-using location and sorts by proximity", async ({ page, cont
   await expect(page.locator(".record-item")).not.toHaveCount(0);
 });
 
+test("resumes saved while-using location tracking preference", async ({ page, context }) => {
+  await context.grantPermissions(["geolocation"], { origin: "http://127.0.0.1:5173" });
+  await context.setGeolocation({ latitude: 33.7701, longitude: -118.1937, accuracy: 25 });
+  await page.addInitScript(() => {
+    window.localStorage.setItem("restroom-map-location-tracking", "enabled");
+  });
+
+  await page.goto("/");
+
+  const locationCard = page.getByLabel("Location tracking", { exact: true });
+  await expect(locationCard.getByText("Tracking your location")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByRole("button", { name: "Stop location tracking" })).toBeVisible();
+  await expect(page.locator(".user-location-marker")).toBeVisible();
+});
+
 test("panning the map does not auto-reset the search area", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByLabel("Interactive restroom map")).toBeVisible();
@@ -37,7 +52,15 @@ test("panning the map does not auto-reset the search area", async ({ page }) => 
   await page.mouse.up();
 
   await expect(page.getByRole("button", { name: "Search this area" })).toBeVisible();
+  const responsePromise = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === "/api/restrooms" && url.searchParams.has("bbox");
+  });
   await page.getByRole("button", { name: "Search this area" }).click();
+  const response = await responsePromise;
+  const url = new URL(response.url());
+  expect(url.searchParams.get("radiusMeters")).toBeNull();
+  expect(url.searchParams.get("bbox")?.split(",")).toHaveLength(4);
   await expect(page.getByRole("button", { name: "Search this area" })).toBeHidden();
 });
 

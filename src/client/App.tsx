@@ -23,11 +23,17 @@ import { osmRasterStyle } from "./mapStyle";
 
 type ActivePanel = "nearby" | "review";
 type TrackingState = "idle" | "requesting" | "active" | "denied" | "unavailable";
+type SearchRequest =
+  | { kind: "center"; lat: number; lng: number; radiusMeters: number }
+  | { kind: "bbox"; bbox: [number, number, number, number]; lat: number; lng: number };
+type SearchMode = "preset" | "location" | "area";
 
 const defaultRadiusMeters = 35_000;
 const trackingRadiusMeters = 12_000;
 const restroomSourceId = "restroom-points-source";
 const restroomLayerId = "restroom-points";
+const locationPreferenceKey = "restroom-map-location-tracking";
+const locationPreferenceCookie = "restroomMapLocationTracking";
 
 declare global {
   interface Window {
@@ -36,7 +42,12 @@ declare global {
 }
 
 export function App() {
-  const [searchOrigin, setSearchOrigin] = useState({ lat: DEFAULT_CENTER.lat, lng: DEFAULT_CENTER.lng });
+  const [searchRequest, setSearchRequest] = useState<SearchRequest>({
+    kind: "center",
+    lat: DEFAULT_CENTER.lat,
+    lng: DEFAULT_CENTER.lng,
+    radiusMeters: defaultRadiusMeters
+  });
   const [restrooms, setRestrooms] = useState<RestroomWithStatus[]>([]);
   const [selected, setSelected] = useState<RestroomWithStatus | null>(null);
   const [stats, setStats] = useState<AppStats | null>(null);
@@ -56,6 +67,7 @@ export function App() {
   const watchIdRef = useRef<number | null>(null);
   const hasCenteredOnUserRef = useRef(false);
   const lastTrackedSearchRef = useRef<{ lat: number; lng: number } | null>(null);
+  const searchModeRef = useRef<SearchMode>("preset");
   const suppressNextMoveEndRef = useRef(false);
   const moveSettledTimerRef = useRef<number | null>(null);
 
@@ -74,17 +86,32 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (!readLocationTrackingPreference()) return;
+    startLocationTracking("location");
+  }, []);
+
+  useEffect(() => {
     const controller = new AbortController();
     setIsLoading(true);
     setError(null);
+    const restroomQuery =
+      searchRequest.kind === "bbox"
+        ? {
+            bbox: searchRequest.bbox,
+            lat: searchRequest.lat,
+            lng: searchRequest.lng,
+            limit: 300,
+            ...filters
+          }
+        : {
+            lat: searchRequest.lat,
+            lng: searchRequest.lng,
+            radiusMeters: searchRequest.radiusMeters,
+            limit: 300,
+            ...filters
+          };
     const timeout = window.setTimeout(() => {
-      void fetchRestrooms({
-        lat: searchOrigin.lat,
-        lng: searchOrigin.lng,
-        radiusMeters: trackingState === "active" ? trackingRadiusMeters : defaultRadiusMeters,
-        limit: 300,
-        ...filters
-      })
+      void fetchRestrooms(restroomQuery)
         .then((records) => {
           if (!controller.signal.aborted) setRestrooms(records);
         })
@@ -99,7 +126,7 @@ export function App() {
       controller.abort();
       window.clearTimeout(timeout);
     };
-  }, [searchOrigin.lat, searchOrigin.lng, filters, trackingState]);
+  }, [searchRequest, filters]);
 
   useEffect(() => {
     if (activePanel !== "review" || reviewQueue.length > 0) return;
@@ -111,7 +138,7 @@ export function App() {
     const map = new maplibregl.Map({
       container: mapContainerRef.current,
       style: osmRasterStyle,
-      center: [searchOrigin.lng, searchOrigin.lat],
+      center: [DEFAULT_CENTER.lng, DEFAULT_CENTER.lat],
       zoom: 10
     });
     map.addControl(new maplibregl.NavigationControl({ visualizePitch: false }), "bottom-right");
@@ -199,24 +226,28 @@ export function App() {
 
   function goToPlace(place: (typeof PLACE_PRESETS)[number]) {
     suppressNextMoveEndRef.current = true;
-    setSearchOrigin({ lat: place.lat, lng: place.lng });
+    searchModeRef.current = "preset";
+    setSearchRequest({ kind: "center", lat: place.lat, lng: place.lng, radiusMeters: defaultRadiusMeters });
     setHasMovedMap(false);
     mapRef.current?.flyTo({ center: [place.lng, place.lat], zoom: place.zoom, duration: 500 });
   }
 
   function useCurrentLocation() {
-    startLocationTracking();
+    startLocationTracking("location");
   }
 
-  function startLocationTracking() {
+  function startLocationTracking(nextSearchMode: SearchMode = "location") {
     if (!navigator.geolocation) {
       setTrackingState("unavailable");
       setLocationMessage("Location is not available in this browser.");
+      writeLocationTrackingPreference(false);
       return;
     }
     if (watchIdRef.current !== null) {
       navigator.geolocation.clearWatch(watchIdRef.current);
     }
+    searchModeRef.current = nextSearchMode;
+    writeLocationTrackingPreference(true);
     setTrackingState("requesting");
     setLocationMessage("Browser permission is needed to track your location while this app is open.");
     const options: PositionOptions = { enableHighAccuracy: true, timeout: 10_000 };
@@ -231,9 +262,10 @@ export function App() {
     watchIdRef.current = null;
     hasCenteredOnUserRef.current = false;
     lastTrackedSearchRef.current = null;
+    writeLocationTrackingPreference(false);
     setTrackingState("idle");
     setUserLocation(null);
-    setLocationMessage("Location tracking is off.");
+    setLocationMessage(null);
   }
 
   function toggleFilter(key: keyof typeof filters) {
@@ -243,9 +275,16 @@ export function App() {
   function searchThisArea() {
     const map = mapRef.current;
     if (!map) return;
-    const mapCenter = map.getCenter();
+    const bounds = map.getBounds();
+    const center = map.getCenter();
     suppressNextMoveEndRef.current = true;
-    setSearchOrigin({ lat: mapCenter.lat, lng: mapCenter.lng });
+    searchModeRef.current = "area";
+    setSearchRequest({
+      kind: "bbox",
+      bbox: [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()],
+      lat: center.lat,
+      lng: center.lng
+    });
     setHasMovedMap(false);
   }
 
@@ -263,9 +302,9 @@ export function App() {
         { latitude: next.lat, longitude: next.lng }
       ) > 50;
     setUserLocation(next);
-    if (shouldRefreshNearby) {
+    if (searchModeRef.current === "location" && shouldRefreshNearby) {
       lastTrackedSearchRef.current = { lat: next.lat, lng: next.lng };
-      setSearchOrigin({ lat: next.lat, lng: next.lng });
+      setSearchRequest({ kind: "center", lat: next.lat, lng: next.lng, radiusMeters: trackingRadiusMeters });
       setHasMovedMap(false);
     }
     setTrackingState("active");
@@ -280,6 +319,7 @@ export function App() {
   function handleLocationError(geoError: GeolocationPositionError) {
     const denied = geoError.code === geoError.PERMISSION_DENIED;
     setTrackingState(denied ? "denied" : "unavailable");
+    writeLocationTrackingPreference(false);
     setLocationMessage(
       denied
         ? "Location permission was denied. Enable location access in the browser to sort by your position."
@@ -652,4 +692,31 @@ function emptyRestroomFeatureCollection() {
     type: "FeatureCollection" as const,
     features: []
   };
+}
+
+function readLocationTrackingPreference(): boolean {
+  try {
+    if (window.localStorage.getItem(locationPreferenceKey) === "enabled") return true;
+  } catch {
+    // Some privacy modes block localStorage; the cookie fallback below keeps the preference usable.
+  }
+  return document.cookie
+    .split(";")
+    .map((item) => item.trim())
+    .includes(`${locationPreferenceCookie}=enabled`);
+}
+
+function writeLocationTrackingPreference(enabled: boolean) {
+  try {
+    if (enabled) {
+      window.localStorage.setItem(locationPreferenceKey, "enabled");
+    } else {
+      window.localStorage.removeItem(locationPreferenceKey);
+    }
+  } catch {
+    // Ignore storage failures and rely on the cookie path.
+  }
+
+  const maxAge = enabled ? 60 * 60 * 24 * 180 : 0;
+  document.cookie = `${locationPreferenceCookie}=${enabled ? "enabled" : ""}; Max-Age=${maxAge}; Path=/; SameSite=Lax`;
 }
